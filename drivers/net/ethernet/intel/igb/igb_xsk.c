@@ -25,25 +25,28 @@ static int igb_xsk_pool_enable(struct igb_adapter *adapter,
 			       u16 qid)
 {
 	struct net_device *netdev = adapter->netdev;
-	struct igb_ring *rx_ring;
+	struct igb_ring *tx_ring, *rx_ring;
 	bool if_running;
 	int err;
 
 	if (qid >= adapter->num_rx_queues)
 		return -EINVAL;
 
-	if (qid >= netdev->real_num_rx_queues)
+	if (qid >= netdev->real_num_rx_queues ||
+	    qid >= netdev->real_num_tx_queues)
 		return -EINVAL;
 
 	err = xsk_pool_dma_map(pool, &adapter->pdev->dev, IGB_RX_DMA_ATTR);
 	if (err)
 		return err;
 
+	tx_ring = adapter->tx_ring[qid];
 	rx_ring = adapter->rx_ring[qid];
 	if_running = netif_running(adapter->netdev) && igb_xdp_is_enabled(adapter);
 	if (if_running)
 		igb_txrx_ring_disable(adapter, qid);
 
+	set_bit(IGB_RING_FLAG_AF_XDP_ZC, &tx_ring->flags);
 	set_bit(IGB_RING_FLAG_AF_XDP_ZC, &rx_ring->flags);
 
 	if (if_running) {
@@ -52,6 +55,7 @@ static int igb_xsk_pool_enable(struct igb_adapter *adapter,
 		/* Kick start the NAPI context so that receiving will start */
 		err = igb_xsk_wakeup(adapter->netdev, qid, XDP_WAKEUP_RX);
 		if (err) {
+			clear_bit(IGB_RING_FLAG_AF_XDP_ZC, &tx_ring->flags);
 			clear_bit(IGB_RING_FLAG_AF_XDP_ZC, &rx_ring->flags);
 			xsk_pool_dma_unmap(pool, IGB_RX_DMA_ATTR);
 			return err;
@@ -63,7 +67,7 @@ static int igb_xsk_pool_enable(struct igb_adapter *adapter,
 
 static int igb_xsk_pool_disable(struct igb_adapter *adapter, u16 qid)
 {
-	struct igb_ring *rx_ring;
+	struct igb_ring *tx_ring, *rx_ring;
 	struct xsk_buff_pool *pool;
 	bool if_running;
 
@@ -71,12 +75,14 @@ static int igb_xsk_pool_disable(struct igb_adapter *adapter, u16 qid)
 	if (!pool)
 		return -EINVAL;
 
+	tx_ring = adapter->tx_ring[qid];
 	rx_ring = adapter->rx_ring[qid];
 	if_running = netif_running(adapter->netdev) && igb_xdp_is_enabled(adapter);
 	if (if_running)
 		igb_txrx_ring_disable(adapter, qid);
 
 	xsk_pool_dma_unmap(pool, IGB_RX_DMA_ATTR);
+	clear_bit(IGB_RING_FLAG_AF_XDP_ZC, &tx_ring->flags);
 	clear_bit(IGB_RING_FLAG_AF_XDP_ZC, &rx_ring->flags);
 
 	if (if_running)
@@ -333,6 +339,61 @@ int igb_clean_rx_irq_zc(struct igb_q_vector *q_vector, const int budget)
 		return (int)total_packets;
 	}
 	return failure ? budget : (int)total_packets;
+}
+
+bool igb_xmit_zc(struct igb_ring *tx_ring, unsigned int budget)
+{
+	struct xsk_buff_pool *pool = tx_ring->xsk_pool;
+	union e1000_adv_tx_desc *tx_desc = NULL;
+	struct igb_tx_buffer *tx_bi;
+	bool work_done = true;
+	struct xdp_desc desc;
+	dma_addr_t dma;
+	u32 cmd_type;
+
+	while (budget-- > 0) {
+		if (unlikely(!igb_desc_unused(tx_ring))) {
+			work_done = false;
+			break;
+		}
+
+		if (!netif_carrier_ok(tx_ring->netdev))
+			break;
+
+		if (!xsk_tx_peek_desc(pool, &desc))
+			break;
+
+		dma = xsk_buff_raw_get_dma(pool, desc.addr);
+		xsk_buff_raw_dma_sync_for_device(pool, dma, desc.len);
+
+		tx_bi = &tx_ring->tx_buffer_info[tx_ring->next_to_use];
+		tx_bi->bytecount = desc.len;
+		tx_bi->type = IGB_TYPE_XSK;
+		tx_bi->xdpf = NULL;
+		tx_bi->gso_segs = 1;
+
+		tx_desc = IGB_TX_DESC(tx_ring, tx_ring->next_to_use);
+		tx_desc->read.buffer_addr = cpu_to_le64(dma);
+
+		/* put descriptor type bits */
+		cmd_type = E1000_ADVTXD_DTYP_DATA | E1000_ADVTXD_DCMD_DEXT |
+			   E1000_ADVTXD_DCMD_IFCS;
+
+		cmd_type |= desc.len | IGB_TXD_DCMD;
+		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
+		tx_desc->read.olinfo_status = 0;
+
+		tx_ring->next_to_use++;
+		if (tx_ring->next_to_use == tx_ring->count)
+			tx_ring->next_to_use = 0;
+	}
+
+	if (tx_desc) {
+		igb_xdp_ring_update_tail(tx_ring);
+		xsk_tx_release(pool);
+	}
+
+	return !!budget && work_done;
 }
 
 int igb_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
